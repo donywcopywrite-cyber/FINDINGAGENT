@@ -1,5 +1,4 @@
 import { tool, Agent, AgentInputItem, Runner, withTrace } from "@openai/agents";
-import { webSearchTool } from "@openai/agents-openai";
 import { z } from "zod";
 
 // ---------- tiny helpers ----------
@@ -42,7 +41,7 @@ const ResultsSchema = z
   })
   .strict();
 
-// ---------- TOOLS ----------
+// ---------- TOOLS (required-but-nullable; no .optional()) ----------
 const normalizeAndDedupeListings = tool({
   name: "normalizeAndDedupeListings",
   description: "Normalize listings, dedupe by MLS (or URL), cap to 12.",
@@ -82,9 +81,9 @@ const normalizeAndDedupeListings = tool({
         url: it.url ?? null,
         address: it.address ?? null,
         price:
-          it.price != null
-            ? Number(it.price)
-            : toPrice((it as any).priceText ?? (it as any).price_str ?? (it as any).askingPrice),
+        it.price != null
+          ? Number(it.price)
+          : toPrice((it as any).priceText ?? (it as any).price_str ?? (it as any).askingPrice),
         beds: toInt(it.beds),
         baths: toInt(it.baths),
         type: it.type ?? null,
@@ -152,11 +151,11 @@ const fetchHtmlPage = tool({
 const searchRealEstateListings = tool({
   name: "searchRealEstateListings",
   description:
-    "Use SerpAPI to get candidate listing URLs (filtered by domain). Returns at most 3 URLs to control tokens.",
+    "Use SerpAPI to get candidate listing URLs (filtered by domain). Returns at most 3 URLs.",
   parameters: z
     .object({
       q: z.string(),
-      num: z.number().int().min(1).max(3).default(3), // cap to 3
+      num: z.number().int().min(1).max(3).default(3),
     })
     .strict(),
   execute: async (input: { q: string; num: number }) => {
@@ -190,27 +189,26 @@ const searchRealEstateListings = tool({
   },
 });
 
-// ✅ Fix here: use "medium" instead of "small"
-const webSearchPreview = webSearchTool({
-  searchContextSize: "medium",
-  userLocation: { country: "CA", type: "approximate" },
-});
-
 // ---------- AGENT ----------
 const agent = new Agent({
-  name: "LISTING FINDER (TPM-safe, structured)",
-  instructions: `FR d'abord, puis EN. Ne pose pas de questions de clarification. Si des infos manquent, fais des hypothèses raisonnables et continue.
+  name: "LISTING FINDER (bounded turns)",
+  instructions: `FR d'abord, puis EN. Ne pose PAS de questions de clarification.
+Si des infos manquent, fais des hypothèses raisonnables et continue.
 Par défaut: ville = Laval, QC; type = condo; chambres = 2+; prix max = 600000 CAD.
-Objectif: renvoyer 5–8 propriétés actuelles à partir de pages publiques (Centris, Realtor.ca, Royal LePage, RE/MAX Québec, DuProprio). 
+
+Objectif: renvoyer 5–8 propriétés actuelles depuis des pages publiques (Centris, Realtor.ca, Royal LePage, RE/MAX Québec, DuProprio).
 Pour chaque propriété: mls (ou "MLS non trouvé / MLS not found"), url, address (si visible), price (CAD), beds, baths, type, note_fr et note_en (une ligne).
 N'invente pas de prix/adresse; laisse null si non visible.
 Dédoublonne par MLS (ou URL si pas d'MLS).
-Utilise au plus 3 résultats de recherche et 3 pages à analyser.
-Réponds UNIQUEMENT au format JSON correspondant au schéma demandé, sans texte additionnel.`,
+
+CONTRAINTES STRICTES:
+- UTILISE AU MAXIMUM 1 appel de recherche ET 3 pages à analyser puis ARRÊTE.
+- SI TU NE PEUX PAS RÉCOLTER ASSEZ D'INFOS, RENVOIE UNE LISTE VIDE PLUTÔT QUE DE CONTINUER.
+- NE DÉPASSE PAS 1 PASS de normalisation (normalizeAndDedupeListings).
+- Réponds UNIQUEMENT en JSON valide conforme au schéma.`,
   model: "gpt-5",
   tools: [
     searchRealEstateListings,
-    webSearchPreview,
     fetchHtmlPage,
     extractListingInfo,
     normalizeAndDedupeListings,
@@ -237,6 +235,8 @@ export const runWorkflow = async (workflow: WorkflowInput) =>
         __trace_source__: "agent-builder",
         workflow_id: "wf_68f11ef926888190a3785994ea8530e8052cc039ed15b5be",
       },
+      // 👇 Hard cap the dialogue so it cannot loop to 10 turns.
+      ...( { maxTurns: 6 } as any ),
     });
 
     const result = await runner.run(agent, conversation);
