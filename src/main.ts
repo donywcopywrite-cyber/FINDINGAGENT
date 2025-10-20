@@ -1,4 +1,5 @@
 import { tool, Agent, AgentInputItem, Runner, withTrace } from "@openai/agents";
+import { webSearchTool } from "@openai/agents-openai";
 import { z } from "zod";
 
 // ---------- tiny helpers ----------
@@ -20,7 +21,28 @@ const stripScriptsStyles = (html: string) =>
     .replace(/\s+/g, " ")
     .trim();
 
-// ---------- TOOLS (all fields required-but-nullable) ----------
+// ---------- OUTPUT SCHEMA (required-but-nullable; no .optional()) ----------
+const ResultsSchema = z
+  .object({
+    listings: z.array(
+      z
+        .object({
+          mls: z.string().nullable(),
+          url: z.string().nullable(),
+          address: z.string().nullable(),
+          price: z.number().nullable(),
+          beds: z.number().nullable(),
+          baths: z.number().nullable(),
+          type: z.string().nullable(),
+          note_fr: z.string().nullable(),
+          note_en: z.string().nullable(),
+        })
+        .strict()
+    ),
+  })
+  .strict();
+
+// ---------- TOOLS (schemas: required-but-nullable; no .optional()) ----------
 const normalizeAndDedupeListings = tool({
   name: "normalizeAndDedupeListings",
   description: "Normalize listings, dedupe by MLS (or URL), cap to 12.",
@@ -33,7 +55,7 @@ const normalizeAndDedupeListings = tool({
             url: z.string().nullable(),
             address: z.string().nullable(),
             price: z.number().nullable(),
-            beds: z.number().int().nullable(),
+            beds: z.number().nullable(),
             baths: z.number().nullable(),
             type: z.string().nullable(),
             note_fr: z.string().nullable(),
@@ -48,10 +70,10 @@ const normalizeAndDedupeListings = tool({
     const out: any[] = [];
 
     for (const it of input.listings ?? []) {
-      const mls =
-        (it.mls ?? it.MLS ?? it.listingId ?? (it as any)["MLS®"])?.toString()?.trim() ||
-        "MLS non trouvé / MLS not found";
-      const key = mls !== "MLS non trouvé / MLS not found" ? `MLS:${mls}` : it.url ? `URL:${it.url}` : "";
+      const rawMls =
+        (it.mls ?? it.MLS ?? it.listingId ?? (it as any)["MLS®"])?.toString()?.trim() || null;
+      const mls = rawMls || "MLS non trouvé / MLS not found";
+      const key = rawMls ? `MLS:${rawMls}` : it.url ? `URL:${it.url}` : "";
       if (key && seen.has(key)) continue;
       if (key) seen.add(key);
 
@@ -82,7 +104,7 @@ const extractListingInfo = tool({
   parameters: z
     .object({
       url: z.string().nullable(),
-      html: z.string(),
+      html: z.string(), // required non-null
     })
     .strict(),
   execute: async (input: { url: string | null; html: string }) => {
@@ -104,6 +126,8 @@ const extractListingInfo = tool({
       beds: bedsMatch ? toInt(bedsMatch[1]) : null,
       baths: bathsMatch ? toInt(bathsMatch[1]) : null,
       type: null,
+      note_fr: null,
+      note_en: null,
     };
   },
 });
@@ -117,7 +141,7 @@ const fetchHtmlPage = tool({
     try {
       const res = await fetch(input.url, { headers: { "User-Agent": "Mozilla/5.0" } });
       const raw = await res.text();
-      const slim = stripScriptsStyles(raw).slice(0, 2000);
+      const slim = stripScriptsStyles(raw).slice(0, 2000); // hard cap
       return { url: input.url, html: slim };
     } catch {
       return { url: input.url, html: "" };
@@ -132,7 +156,7 @@ const searchRealEstateListings = tool({
   parameters: z
     .object({
       q: z.string(),
-      num: z.number().int().min(1).max(3).default(3),
+      num: z.number().int().min(1).max(3).default(3), // cap to 3
     })
     .strict(),
   execute: async (input: { q: string; num: number }) => {
@@ -166,24 +190,35 @@ const searchRealEstateListings = tool({
   },
 });
 
+// OpenAI hosted web search (no extra key). Keep the context small.
+const webSearchPreview = webSearchTool({
+  searchContextSize: "small",
+  userLocation: { country: "CA", type: "approximate" },
+});
+
 // ---------- AGENT ----------
 const agent = new Agent({
-  name: "LISTING FINDER (TPM-safe)",
-  instructions: `You are “Listings Finder”, a bilingual (FR first, then EN) assistant for Québec.
-Rules:
-- Fetch at most 3 pages total.
-- Keep tool outputs small (HTML already truncated).
-- Return 5–12 properties with: MLS (or 'MLS non trouvé / MLS not found'), URL, price (CAD), beds, baths, address, type, one-line note.
-- Keep it concise, FR first then EN. Keep final answer short.`,
+  name: "LISTING FINDER (TPM-safe, structured)",
+  instructions: `FR d'abord, puis EN. Ne pose pas de questions de clarification. Si des infos manquent, fais des hypothèses raisonnables et continue.
+Par défaut: ville = Laval, QC; type = condo; chambres = 2+; prix max = 600000 CAD.
+Objectif: renvoyer 5–8 propriétés actuelles à partir de pages publiques (Centris, Realtor.ca, Royal LePage, RE/MAX Québec, DuProprio). 
+Pour chaque propriété: mls (ou "MLS non trouvé / MLS not found"), url, address (si visible), price (CAD), beds, baths, type, note_fr et note_en (une ligne).
+N'invente pas de prix/adresse; laisse null si non visible.
+Dédoublonne par MLS (ou URL si pas d'MLS).
+Utilise au plus 3 résultats de recherche et 3 pages à analyser.
+Réponds UNIQUEMENT au format JSON correspondant au schéma demandé, sans texte additionnel.`,
   model: "gpt-5",
   tools: [
-    normalizeAndDedupeListings,
-    extractListingInfo,
-    fetchHtmlPage,
+    // tools are available; the agent can choose when to use them
     searchRealEstateListings,
+    webSearchPreview,
+    fetchHtmlPage,
+    extractListingInfo,
+    normalizeAndDedupeListings,
   ],
+  outputType: ResultsSchema,
   modelSettings: {
-    parallelToolCalls: false,
+    parallelToolCalls: false, // serialize to keep tokens low
     reasoning: { effort: "low" },
     store: true,
   },
@@ -208,8 +243,10 @@ export const runWorkflow = async (workflow: WorkflowInput) =>
     const result = await runner.run(agent, conversation);
     if (!result.finalOutput) throw new Error("Agent result is undefined");
 
+    // Return structured listings directly for Bubble
     return {
       output_text: JSON.stringify(result.finalOutput),
-      output_parsed: result.finalOutput,
+      output_parsed: result.finalOutput,          // { listings: [...] }
+      listings: result.finalOutput.listings ?? [], // convenience
     };
   });
