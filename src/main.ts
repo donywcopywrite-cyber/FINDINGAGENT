@@ -1,6 +1,5 @@
 import { tool, Agent, AgentInputItem, Runner, withTrace } from "@openai/agents";
-// If you don't need web search right now, keep this commented out to minimize moving parts.
-// import { webSearchTool } from "@openai/agents-openai";
+// import { webSearchTool } from "@openai/agents-openai"; // keep disabled for now to reduce moving parts
 import { z } from "zod";
 
 // ---------- tiny helpers ----------
@@ -15,7 +14,7 @@ const toPrice = (s: any) => {
   return Number.isFinite(n) ? n : null;
 };
 
-// ---------- TOOLS (schemas kept ultra-simple) ----------
+// ---------- TOOLS (all fields required-but-nullable; no .optional()) ----------
 const normalizeAndDedupeListings = tool({
   name: "normalizeAndDedupeListings",
   description: "Normalize listings, dedupe by MLS (or URL), cap to 12.",
@@ -24,15 +23,15 @@ const normalizeAndDedupeListings = tool({
       listings: z.array(
         z
           .object({
-            mls: z.string().optional(),
-            url: z.string().optional(),
-            address: z.string().optional(),
-            price: z.number().optional(),
-            beds: z.number().int().optional(),
-            baths: z.number().optional(),
-            type: z.string().optional(),
-            note_fr: z.string().optional(),
-            note_en: z.string().optional(),
+            mls: z.string().nullable(),
+            url: z.string().nullable(),
+            address: z.string().nullable(),
+            price: z.number().nullable(),
+            beds: z.number().int().nullable(),
+            baths: z.number().nullable(),
+            type: z.string().nullable(),
+            note_fr: z.string().nullable(),
+            note_en: z.string().nullable(),
           })
           .strict()
       ),
@@ -43,7 +42,9 @@ const normalizeAndDedupeListings = tool({
     const out: any[] = [];
 
     for (const it of input.listings ?? []) {
-      const mls = (it.mls ?? "").toString().trim() || "MLS non trouvé / MLS not found";
+      const mls =
+        (it.mls ?? it.MLS ?? it.listingId ?? (it as any)["MLS®"])?.toString()?.trim() ||
+        "MLS non trouvé / MLS not found";
       const key = mls !== "MLS non trouvé / MLS not found" ? `MLS:${mls}` : it.url ? `URL:${it.url}` : "";
       if (key && seen.has(key)) continue;
       if (key) seen.add(key);
@@ -52,7 +53,10 @@ const normalizeAndDedupeListings = tool({
         mls,
         url: it.url ?? null,
         address: it.address ?? null,
-        price: it.price != null ? Number(it.price) : null,
+        price:
+          it.price != null
+            ? Number(it.price)
+            : toPrice((it as any).priceText ?? (it as any).price_str ?? (it as any).askingPrice),
         beds: toInt(it.beds),
         baths: toInt(it.baths),
         type: it.type ?? null,
@@ -69,13 +73,14 @@ const normalizeAndDedupeListings = tool({
 const extractListingInfo = tool({
   name: "extractListingInfo",
   description: "Extract MLS, price, beds, baths from supplied HTML.",
+  // NOTE: both fields required at schema level; allow null for url
   parameters: z
     .object({
-      url: z.string().optional(),   // plain string (no .url())
-      html: z.string(),
+      url: z.string().nullable(),
+      html: z.string(), // required and non-null
     })
     .strict(),
-  execute: async (input: { url?: string; html: string }) => {
+  execute: async (input: { url: string | null; html: string }) => {
     const mls =
       /MLS[®™]?\s*#?\s*[:\-]?\s*([A-Z0-9\-]+)/i.exec(input.html)?.[1] ??
       /Centris\s*#\s*([0-9\-]+)/i.exec(input.html)?.[1] ??
@@ -88,7 +93,7 @@ const extractListingInfo = tool({
 
     return {
       mls: mls ?? "MLS non trouvé / MLS not found",
-      url: input.url ?? null,
+      url: input.url,
       address: null,
       price: priceMatch ? toPrice(priceMatch[0]) : null,
       beds: bedsMatch ? toInt(bedsMatch[1]) : null,
@@ -153,7 +158,6 @@ const searchRealEstateListings = tool({
   },
 });
 
-// Optional built-in search preview. Keep disabled to minimize variables.
 // const webSearchPreview = webSearchTool({ searchContextSize: "medium", userLocation: { country: "CA", type: "approximate" } });
 
 // ---------- AGENT ----------
