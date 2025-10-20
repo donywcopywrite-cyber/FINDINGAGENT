@@ -1,5 +1,4 @@
 import { tool, Agent, AgentInputItem, Runner, withTrace } from "@openai/agents";
-// import { webSearchTool } from "@openai/agents-openai"; // keep disabled for now to reduce moving parts
 import { z } from "zod";
 
 // ---------- tiny helpers ----------
@@ -13,8 +12,15 @@ const toPrice = (s: any) => {
   const n = Number(String(s).replace(/[^\d]/g, ""));
   return Number.isFinite(n) ? n : null;
 };
+const stripScriptsStyles = (html: string) =>
+  html
+    .replace(/<script[\s\S]*?<\/script>/gi, "")
+    .replace(/<style[\s\S]*?<\/style>/gi, "")
+    .replace(/<!--[\s\S]*?-->/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
 
-// ---------- TOOLS (all fields required-but-nullable; no .optional()) ----------
+// ---------- TOOLS (schemas: required-but-nullable; no .optional()) ----------
 const normalizeAndDedupeListings = tool({
   name: "normalizeAndDedupeListings",
   description: "Normalize listings, dedupe by MLS (or URL), cap to 12.",
@@ -73,11 +79,10 @@ const normalizeAndDedupeListings = tool({
 const extractListingInfo = tool({
   name: "extractListingInfo",
   description: "Extract MLS, price, beds, baths from supplied HTML.",
-  // NOTE: both fields required at schema level; allow null for url
   parameters: z
     .object({
       url: z.string().nullable(),
-      html: z.string(), // required and non-null
+      html: z.string(), // required non-null
     })
     .strict(),
   execute: async (input: { url: string | null; html: string }) => {
@@ -105,13 +110,15 @@ const extractListingInfo = tool({
 
 const fetchHtmlPage = tool({
   name: "fetchHtmlPage",
-  description: "Fetch an HTML page (simple).",
+  description:
+    "Fetch an HTML page (returns at most 2000 chars, scripts/styles removed) to prevent token bloat.",
   parameters: z.object({ url: z.string() }).strict(),
   execute: async (input: { url: string }) => {
     try {
       const res = await fetch(input.url, { headers: { "User-Agent": "Mozilla/5.0" } });
-      const html = await res.text();
-      return { url: input.url, html };
+      const raw = await res.text();
+      const slim = stripScriptsStyles(raw).slice(0, 2000); // hard cap
+      return { url: input.url, html: slim };
     } catch {
       return { url: input.url, html: "" };
     }
@@ -120,11 +127,12 @@ const fetchHtmlPage = tool({
 
 const searchRealEstateListings = tool({
   name: "searchRealEstateListings",
-  description: "Use SerpAPI to get candidate listing URLs (filtered by domain).",
+  description:
+    "Use SerpAPI to get candidate listing URLs (filtered by domain). Returns at most 3 URLs to control tokens.",
   parameters: z
     .object({
       q: z.string(),
-      num: z.number().int().min(1).max(20).default(10),
+      num: z.number().int().min(1).max(3).default(3), // cap to 3
     })
     .strict(),
   execute: async (input: { q: string; num: number }) => {
@@ -134,7 +142,7 @@ const searchRealEstateListings = tool({
     const u = new URL("https://serpapi.com/search.json");
     u.searchParams.set("engine", "google");
     u.searchParams.set("q", input.q);
-    u.searchParams.set("num", String(input.num));
+    u.searchParams.set("num", String(Math.min(3, input.num)));
     u.searchParams.set("hl", "fr");
     u.searchParams.set("gl", "ca");
     u.searchParams.set("api_key", key);
@@ -151,30 +159,35 @@ const searchRealEstateListings = tool({
       try {
         const host = new URL(link).hostname.toLowerCase();
         if (allowed.some((d) => host === d || host.endsWith("." + d))) results.push(link);
-        if (results.length >= input.num) break;
+        if (results.length >= 3) break;
       } catch {}
     }
-    return { q: input.q, num: input.num, results };
+    return { q: input.q, num: Math.min(3, input.num), results };
   },
 });
 
-// const webSearchPreview = webSearchTool({ searchContextSize: "medium", userLocation: { country: "CA", type: "approximate" } });
-
 // ---------- AGENT ----------
 const agent = new Agent({
-  name: "LISTING FINDER (Minimal)",
+  name: "LISTING FINDER (TPM-safe)",
   instructions: `You are “Listings Finder”, a bilingual (FR first, then EN) assistant for Québec.
-Return 5–12 properties with: MLS (or 'MLS non trouvé / MLS not found'), URL, price (CAD), beds, baths, address, type, one-line note.
-Keep it concise, FR first then EN.`,
+Rules:
+- Fetch at most 3 pages total.
+- Keep tool outputs small (HTML already truncated).
+- Return 5–12 properties with: MLS (or 'MLS non trouvé / MLS not found'), URL, price (CAD), beds, baths, address, type, one-line note.
+- Keep it concise, FR first then EN.`,
   model: "gpt-5",
   tools: [
     normalizeAndDedupeListings,
     extractListingInfo,
     fetchHtmlPage,
     searchRealEstateListings,
-    // webSearchPreview,
   ],
-  modelSettings: { parallelToolCalls: true, reasoning: { effort: "low" }, store: true },
+  modelSettings: {
+    parallelToolCalls: false,            // serialize tool calls
+    reasoning: { effort: "low" },
+    store: true,
+    maxOutputTokens: 1000,               // cap output size
+  },
 });
 
 // ---------- WORKFLOW ----------
