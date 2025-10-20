@@ -21,7 +21,7 @@ const stripScriptsStyles = (html: string) =>
     .replace(/\s+/g, " ")
     .trim();
 
-// ---------- OUTPUT SCHEMA (required-but-nullable; no .optional()) ----------
+// ---------- OUTPUT SCHEMA ----------
 const ResultsSchema = z
   .object({
     listings: z.array(
@@ -42,7 +42,7 @@ const ResultsSchema = z
   })
   .strict();
 
-// ---------- TOOLS (schemas: required-but-nullable; no .optional()) ----------
+// ---------- TOOLS ----------
 const normalizeAndDedupeListings = tool({
   name: "normalizeAndDedupeListings",
   description: "Normalize listings, dedupe by MLS (or URL), cap to 12.",
@@ -190,9 +190,9 @@ const searchRealEstateListings = tool({
   },
 });
 
-// OpenAI hosted web search (no extra key). Keep the context small.
+// ✅ Fix here: use "medium" instead of "small"
 const webSearchPreview = webSearchTool({
-  searchContextSize: "small",
+  searchContextSize: "medium",
   userLocation: { country: "CA", type: "approximate" },
 });
 
@@ -209,7 +209,6 @@ Utilise au plus 3 résultats de recherche et 3 pages à analyser.
 Réponds UNIQUEMENT au format JSON correspondant au schéma demandé, sans texte additionnel.`,
   model: "gpt-5",
   tools: [
-    // tools are available; the agent can choose when to use them
     searchRealEstateListings,
     webSearchPreview,
     fetchHtmlPage,
@@ -218,7 +217,7 @@ Réponds UNIQUEMENT au format JSON correspondant au schéma demandé, sans texte
   ],
   outputType: ResultsSchema,
   modelSettings: {
-    parallelToolCalls: false, // serialize to keep tokens low
+    parallelToolCalls: false,
     reasoning: { effort: "low" },
     store: true,
   },
@@ -243,10 +242,9 @@ export const runWorkflow = async (workflow: WorkflowInput) =>
     const result = await runner.run(agent, conversation);
     if (!result.finalOutput) throw new Error("Agent result is undefined");
 
-    // Return structured listings directly for Bubble
     return {
       output_text: JSON.stringify(result.finalOutput),
-      output_parsed: result.finalOutput,          // { listings: [...] }
-      listings: result.finalOutput.listings ?? [], // convenience
+      output_parsed: result.finalOutput,
+      listings: result.finalOutput.listings ?? [],
     };
   });
