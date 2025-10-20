@@ -20,7 +20,7 @@ const stripScriptsStyles = (html: string) =>
     .replace(/\s+/g, " ")
     .trim();
 
-// ---------- TOOLS (schemas: required-but-nullable; no .optional()) ----------
+// ---------- TOOLS (all fields required-but-nullable) ----------
 const normalizeAndDedupeListings = tool({
   name: "normalizeAndDedupeListings",
   description: "Normalize listings, dedupe by MLS (or URL), cap to 12.",
@@ -82,7 +82,7 @@ const extractListingInfo = tool({
   parameters: z
     .object({
       url: z.string().nullable(),
-      html: z.string(), // required non-null
+      html: z.string(),
     })
     .strict(),
   execute: async (input: { url: string | null; html: string }) => {
@@ -117,7 +117,7 @@ const fetchHtmlPage = tool({
     try {
       const res = await fetch(input.url, { headers: { "User-Agent": "Mozilla/5.0" } });
       const raw = await res.text();
-      const slim = stripScriptsStyles(raw).slice(0, 2000); // hard cap
+      const slim = stripScriptsStyles(raw).slice(0, 2000);
       return { url: input.url, html: slim };
     } catch {
       return { url: input.url, html: "" };
@@ -132,7 +132,7 @@ const searchRealEstateListings = tool({
   parameters: z
     .object({
       q: z.string(),
-      num: z.number().int().min(1).max(3).default(3), // cap to 3
+      num: z.number().int().min(1).max(3).default(3),
     })
     .strict(),
   execute: async (input: { q: string; num: number }) => {
@@ -174,7 +174,7 @@ Rules:
 - Fetch at most 3 pages total.
 - Keep tool outputs small (HTML already truncated).
 - Return 5–12 properties with: MLS (or 'MLS non trouvé / MLS not found'), URL, price (CAD), beds, baths, address, type, one-line note.
-- Keep it concise, FR first then EN.`,
+- Keep it concise, FR first then EN. Keep final answer short.`,
   model: "gpt-5",
   tools: [
     normalizeAndDedupeListings,
@@ -183,10 +183,9 @@ Rules:
     searchRealEstateListings,
   ],
   modelSettings: {
-    parallelToolCalls: false,            // serialize tool calls
+    parallelToolCalls: false,
     reasoning: { effort: "low" },
     store: true,
-    maxOutputTokens: 1000,               // cap output size
   },
 });
 
