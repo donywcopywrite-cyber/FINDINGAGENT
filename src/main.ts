@@ -4,30 +4,65 @@ import { z } from "zod";
 import { OpenAI } from "openai";
 import { runGuardrails } from "@openai/guardrails";
 
-// ---------- Tools ----------
+// ---------- helpers ----------
+const numberFromPriceLike = (s?: string | null) => {
+  if (!s) return null;
+  const raw = s.replace(/[^\d]/g, "");
+  if (!raw) return null;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : null;
+};
+
+// ---------- tools ----------
 const normalizeAndDedupeListings = tool({
   name: "normalizeAndDedupeListings",
   description: "Normalize listings, dedupe by MLS, cap to 12.",
+  // IMPORTANT: explicit object schema + passthrough to satisfy JSON-Schema ("type" + additionalProperties)
   parameters: z.object({
-    listings: z.array(z.record(z.any())),
+    listings: z.array(
+      z
+        .object({
+          mls: z.string().nullable().optional(),
+          url: z.string().url().nullable().optional(),
+          address: z.string().nullable().optional(),
+          price: z.number().nullable().optional(),
+          beds: z.number().int().nullable().optional(),
+          baths: z.number().nullable().optional(),
+          type: z.string().nullable().optional(),
+          note_fr: z.string().nullable().optional(),
+          note_en: z.string().nullable().optional(),
+        })
+        .passthrough()
+    ),
   }),
   execute: async (input: { listings: Record<string, any>[] }) => {
     const seen = new Set<string>();
     const out: any[] = [];
     for (const it of input.listings ?? []) {
-      const mls = it.mls ?? it.MLS ?? "MLS non trouvé / MLS not found";
+      const mls =
+        (it.mls ?? it.MLS ?? it.listingId ?? it["MLS®"])?.toString()?.trim() ||
+        "MLS non trouvé / MLS not found";
       const key = mls !== "MLS non trouvé / MLS not found" ? `MLS:${mls}` : it.url ?? "";
-      if (seen.has(key)) continue;
-      seen.add(key);
+      if (key && seen.has(key)) continue;
+      if (key) seen.add(key);
+
+      const price =
+        it.price != null
+          ? Number(it.price)
+          : numberFromPriceLike(it.priceText ?? it.price_str ?? it.askingPrice);
+
       out.push({
         mls,
         url: it.url ?? null,
         address: it.address ?? null,
-        price: Number(it.price) || null,
-        beds: it.beds ?? null,
-        baths: it.baths ?? null,
+        price: Number.isFinite(price as number) ? (price as number) : null,
+        beds: it.beds != null ? Number(String(it.beds).replace(/[^\d]/g, "")) : null,
+        baths: it.baths != null ? Number(String(it.baths).replace(/[^\d.]/g, "")) : null,
         type: it.type ?? null,
+        note_fr: it.note_fr ?? null,
+        note_en: it.note_en ?? null,
       });
+
       if (out.length >= 12) break;
     }
     return { listings: out };
@@ -39,62 +74,84 @@ const extractListingInfo = tool({
   description: "Extract listing info from HTML or URL.",
   parameters: z.object({ url: z.string(), html: z.string() }),
   execute: async (input: { url: string; html: string }) => {
-    const mlsMatch = input.html.match(/MLS[®™]?\s*#?\s*[:\-]?\s*([A-Z0-9\-]+)/i);
+    const mls =
+      /MLS[®™]?\s*#?\s*[:\-]?\s*([A-Z0-9\-]+)/i.exec(input.html)?.[1] ??
+      /Centris\s*#\s*([0-9\-]+)/i.exec(input.html)?.[1] ??
+      null;
     const priceMatch = input.html.match(/\$\s*[0-9][0-9,.\s]*/);
+    const bedsMatch = input.html.match(/"bedrooms"\s*:\s*(\d+)/i) || input.html.match(/(\d+)\s*beds?/i);
+    const bathsMatch =
+      input.html.match(/"bathrooms"\s*:\s*(\d+(\.\d+)?)/i) ||
+      input.html.match(/(\d+(\.\d+)?)\s*baths?/i);
+
     return {
-      mls: mlsMatch?.[1] ?? "MLS non trouvé / MLS not found",
+      mls: mls ?? "MLS non trouvé / MLS not found",
       url: input.url,
-      price: priceMatch ? Number(priceMatch[0].replace(/[^\d]/g, "")) : null,
+      address: null,
+      price: priceMatch ? numberFromPriceLike(priceMatch[0]) : null,
+      beds: bedsMatch ? Number(String(bedsMatch[1]).replace(/[^\d]/g, "")) : null,
+      baths: bathsMatch ? Number(String(bathsMatch[1]).replace(/[^\d.]/g, "")) : null,
+      type: null,
     };
   },
 });
 
 const fetchHtmlPage = tool({
   name: "fetchHtmlPage",
-  description: "Fetch HTML page with retries.",
+  description: "Fetch HTML page with desktop UA.",
   parameters: z.object({ url: z.string() }),
   execute: async (input: { url: string }) => {
     try {
       const res = await fetch(input.url, {
-        headers: { "User-Agent": "Mozilla/5.0" },
+        headers: {
+          "User-Agent":
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+          Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        },
       });
+      if (!res.ok) throw new Error(String(res.status));
       const html = await res.text();
       return { url: input.url, html };
     } catch {
-      return { url: input.url, html: "" };
+      return { url: input.url, html: "" }; // safe fallback
     }
   },
 });
 
 const searchRealEstateListings = tool({
   name: "searchRealEstateListings",
-  description: "Search listing URLs via SerpAPI.",
+  description: "Search listing URLs via SerpAPI; filter to major CA domains.",
   parameters: z.object({
     q: z.string(),
     num: z.number().int().min(1).max(20).default(10),
   }),
   execute: async (input: { q: string; num: number }) => {
     const key = process.env.SERPAPI_KEY;
-    if (!key) return { results: [] };
+    if (!key) return { q: input.q, num: input.num, results: [] };
     const url = new URL("https://serpapi.com/search.json");
     url.searchParams.set("engine", "google");
     url.searchParams.set("q", input.q);
     url.searchParams.set("num", String(input.num));
+    url.searchParams.set("hl", "fr");
+    url.searchParams.set("gl", "ca");
     url.searchParams.set("api_key", key);
+
     const res = await fetch(url);
+    if (!res.ok) return { q: input.q, num: input.num, results: [] };
     const data = await res.json();
+
     const allowed = ["centris.ca", "realtor.ca", "royallepage.ca", "remax-quebec.com", "duproprio.com"];
-    const results = (data.organic_results ?? [])
-      .map((r: any) => r.link)
-      .filter((u: string) => {
-        try {
-          const host = new URL(u).hostname;
-          return allowed.some((d) => host.endsWith(d));
-        } catch {
-          return false;
-        }
-      });
-    return { results };
+    const results: string[] = [];
+    for (const r of data.organic_results ?? []) {
+      const link = r.link;
+      if (!link) continue;
+      try {
+        const host = new URL(link).hostname.toLowerCase();
+        if (allowed.some((d) => host === d || host.endsWith("." + d))) results.push(link);
+        if (results.length >= input.num) break;
+      } catch {}
+    }
+    return { q: input.q, num: input.num, results };
   },
 });
 
@@ -103,7 +160,7 @@ const webSearchPreview = webSearchTool({
   userLocation: { country: "CA", type: "approximate" },
 });
 
-// ---------- Guardrails ----------
+// ---------- guardrails ----------
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const guardrailsConfig = {
   guardrails: [
@@ -114,13 +171,14 @@ const guardrailsConfig = {
   ],
 };
 const context = { guardrailLlm: client };
+const guardrailsHasTripwire = (results: any[]) => (results ?? []).some((r) => r?.tripwireTriggered);
 
-// ---------- Agent ----------
+// ---------- agent ----------
 const ListingFinder = new Agent({
   name: "LISITNG FINDER",
   instructions: `You are “Listings Finder”, a bilingual (FR first, then EN) real-estate agent assistant for Québec.
-Return 5–12 currently-listed properties (MLS, URL, price, beds, baths, address, note).
-Respect site TOS. Output FR first, then EN.`,
+Return 5–12 current properties with: MLS, URL, address/area, price (CAD), beds, baths, type, one-line note.
+If MLS isn't visible, say "MLS non trouvé / MLS not found". Keep concise, FR first then EN.`,
   model: "gpt-5",
   tools: [
     normalizeAndDedupeListings,
@@ -132,7 +190,7 @@ Respect site TOS. Output FR first, then EN.`,
   modelSettings: { parallelToolCalls: true, reasoning: { effort: "low" }, store: true },
 });
 
-// ---------- Workflow ----------
+// ---------- workflow ----------
 type WorkflowInput = { input_as_text: string };
 
 export const runWorkflow = async (workflow: WorkflowInput) =>
@@ -142,8 +200,7 @@ export const runWorkflow = async (workflow: WorkflowInput) =>
     ];
 
     const guard = await runGuardrails(workflow.input_as_text, guardrailsConfig as any, context as any);
-    const hasTrip = (guard ?? []).some((r: any) => r?.tripwireTriggered);
-    if (hasTrip) return { blocked: true };
+    if (guardrailsHasTripwire(guard as any[])) return { blocked: true };
 
     const runner = new Runner({
       traceMetadata: {
@@ -153,6 +210,8 @@ export const runWorkflow = async (workflow: WorkflowInput) =>
     });
 
     const result = await runner.run(ListingFinder, conversation);
+    if (!result.finalOutput) throw new Error("Agent result is undefined");
+
     return {
       output_text: JSON.stringify(result.finalOutput),
       output_parsed: result.finalOutput,
